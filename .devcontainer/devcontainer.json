@@ -1,0 +1,49 @@
+{
+  "name": "kerchunk",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "args":{
+      "USERNAME": "devuser",
+      "USER_UID": "1000",
+      "USER_GID": "1000"
+    },
+    "context": ".."
+  },
+  "remoteUser": "devuser",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-python.black-formatter",
+        "ms-python.isort",
+        "ms-python.flake8",
+        "ms-toolsai.jupyter",
+        "charliermarsh.ruff"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/opt/conda/bin/python",
+        "python.formatting.provider": "black",
+        "python.linting.enabled": true,
+        "python.linting.flake8Enabled": true,
+        "python.linting.mypyEnabled": true,
+        "python.testing.pytestEnabled": true,
+        "python.testing.unittestEnabled": false,
+        "editor.formatOnSave": true,
+        "editor.codeActionsOnSave": {
+          "source.organizeImports": "explicit"
+        },
+        "[python]": {
+          "editor.defaultFormatter": "ms-python.black-formatter"
+        }
+      }
+    }
+  },
+  "postCreateCommand": "python --version && pip install --user -e .[dev]",  // TODO: Remove pip install when built as part of the container itself in Dockerfile
+  "features": {
+    "ghcr.io/devcontainers/features/git:1": {}
+  },
+  "mounts": [
+    "source=${localWorkspaceFolder},target=/home/devuser/workspace,type=bind,consistency=cached"
+  ]
+}

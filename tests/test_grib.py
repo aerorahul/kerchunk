@@ -5,27 +5,40 @@ import fsspec
 import numpy as np
 import pandas as pd
 import pytest
+import ujson
 import xarray as xr
 import zarr
-import ujson
 from fsspec.implementations.asyn_wrapper import AsyncFileSystemWrapper
-from kerchunk.grib2 import (
-    scan_grib,
-    _split_file,
-    GribToZarr,
-    grib_tree,
-    correct_hrrr_subhf_step,
-    parse_grib_idx,
-)
+
 from kerchunk._grib_idx import (
     extract_dataset_chunk_index,
     extract_datatree_chunk_index,
+)
+from kerchunk.grib2 import (
+    GribToZarr,
+    _resolve_grib_engine,
+    _split_file,
+    correct_hrrr_subhf_step,
+    grib_tree,
+    parse_grib_idx,
+    scan_grib,
 )
 from kerchunk.utils import fs_as_store, refs_as_store
 
 eccodes_ver = tuple(int(i) for i in eccodes.__version__.split("."))
 cfgrib = pytest.importorskip("cfgrib")
 here = os.path.dirname(__file__)
+
+
+def test_default_grib_engine(monkeypatch):
+    monkeypatch.delenv("KERCHUNK_GRIB_ENGINE", raising=False)
+    assert _resolve_grib_engine() == "cfgrib"
+
+
+def test_invalid_grib_engine(monkeypatch):
+    monkeypatch.setenv("KERCHUNK_GRIB_ENGINE", "invalid")
+    with pytest.raises(ValueError, match="KERCHUNK_GRIB_ENGINE"):
+        _resolve_grib_engine()
 
 
 def test_one():

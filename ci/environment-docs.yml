@@ -33,3 +33,5 @@ dependencies:
   - numpydoc
   - sphinx-rtd-theme
   - ujson
+  - grib2io
+  - orjson

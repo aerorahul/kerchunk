@@ -2,46 +2,328 @@ import base64
 import copy
 import io
 import logging
+import os
+import re
 from collections import defaultdict
-from typing import Iterable, List, Dict, Set
-import ujson
+from typing import Dict, Iterable, List, Set
 
 import fsspec
-import zarr
-import xarray
 import numpy as np
+import ujson
+import xarray
+import zarr
 
+from kerchunk._grib_idx import (
+    AggregationType,
+    build_idx_grib_mapping,
+    extract_datatree_chunk_index,
+    map_from_index,
+    parse_grib_idx,
+    read_store,
+    reinflate_grib_store,
+    strip_datavar_chunks,
+    write_store,
+)
+from kerchunk.codecs import GRIBCodec
+from kerchunk.combine import MultiZarrToZarr, drop
 from kerchunk.utils import (
-    class_factory,
     _encode_for_JSON,
+    class_factory,
     dict_to_store,
     fs_as_store,
     translate_refs_serializable,
 )
-from kerchunk.codecs import GRIBCodec
-from kerchunk.combine import MultiZarrToZarr, drop
-from kerchunk._grib_idx import (
-    parse_grib_idx,
-    build_idx_grib_mapping,
-    map_from_index,
-    strip_datavar_chunks,
-    reinflate_grib_store,
-    extract_datatree_chunk_index,
-    AggregationType,
-    read_store,
-    write_store,
-)
-
 
 try:
-    import cfgrib
+    import cfgrib as _cfgrib
 except ModuleNotFoundError as err:  # pragma: no cover
     if err.name == "cfgrib":
+        _cfgrib = None
+
+
+_GRIB_ENGINE_ENV_VAR = "KERCHUNK_GRIB_ENGINE"
+_DEFAULT_GRIB_ENGINE = "cfgrib"
+_VALID_GRIB_ENGINES = (_DEFAULT_GRIB_ENGINE, "grib2io")
+
+
+def _require_cfgrib():
+    if _cfgrib is None:  # pragma: no cover
         raise ImportError(
-            "cfgrib is needed to kerchunk GRIB2 files. Please install it with "
-            "`conda install -c conda-forge cfgrib`. See https://github.com/ecmwf/cfgrib "
-            "for more details."
+            "cfgrib is needed to kerchunk GRIB2 files when using the 'cfgrib' engine. "
+            "Please install it with `conda install -c conda-forge cfgrib`. "
+            "See https://github.com/ecmwf/cfgrib for more details."
         )
+    return _cfgrib
+
+
+def _require_grib2io():
+    try:
+        import grib2io
+    except ModuleNotFoundError as err:  # pragma: no cover
+        if err.name == "grib2io":
+            raise ImportError(
+                "grib2io is needed to kerchunk GRIB2 files when using the 'grib2io' "
+                "engine. Please install it with `conda install -c conda-forge grib2io` "
+                "or `pip install grib2io`."
+            )
+        raise
+    return grib2io
+
+
+def _resolve_grib_engine() -> str:
+    engine = os.environ.get(_GRIB_ENGINE_ENV_VAR, _DEFAULT_GRIB_ENGINE)
+    engine = (engine or _DEFAULT_GRIB_ENGINE).strip().lower()
+    if engine not in _VALID_GRIB_ENGINES:
+        opts = ", ".join(repr(opt) for opt in _VALID_GRIB_ENGINES)
+        raise ValueError(
+            f"Invalid {_GRIB_ENGINE_ENV_VAR}={engine!r}. Supported engines are: {opts}."
+        )
+    return engine
+
+
+class _CfgribMessageAdapter:
+    def __init__(self, message, codes_id):
+        self._message = message
+        self.codes_id = codes_id
+
+    def __contains__(self, key):
+        return key in self._message
+
+    def __getitem__(self, key):
+        return self._message[key]
+
+    def get(self, key, default=None):
+        return self._message.get(key, default)
+
+    def message_grib_keys(self):
+        return self._message.message_grib_keys()
+
+
+class _Grib2ioMessageAdapter:
+    _GRID_TYPE_BY_GDTN = {
+        0: "regular_ll",
+        1: "rotated_ll",
+        10: "mercator",
+        20: "polar_stereographic",
+        30: "lambert",
+        31: "albers",
+        40: "reduced_gg",
+    }
+
+    _KEY_ALIASES = {
+        "Ny": "ny",
+        "Nx": "nx",
+        "shortName": "shortName",
+        "topLevel": "topLevel",
+        "time": "refDate",
+        "valid_time": "validDate",
+    }
+
+    _TYPE_OF_LEVEL_BY_SURFACE = {
+        1: "surface",
+        8: "nominalTop",
+        10: "atmosphere",
+        100: "isobaricInhPa",
+        101: "meanSea",
+        103: "heightAboveGround",
+        106: "depthBelowLandLayer",
+        160: "depthBelowSea",
+    }
+
+    def __init__(self, message, file_handle):
+        self._message = message
+        self._file_handle = file_handle
+        self.codes_id = None
+
+    @staticmethod
+    def _unwrap_value(value):
+        out = getattr(value, "value", value)
+        if isinstance(out, np.generic):
+            return out.item()
+        return out
+
+    def _get_attr(self, key):
+        if not hasattr(self._message, key):
+            raise KeyError(key)
+        return self._unwrap_value(getattr(self._message, key))
+
+    def __contains__(self, key):
+        try:
+            self[key]
+            return True
+        except KeyError:
+            return False
+
+    def __getitem__(self, key):
+        if key == "values":
+            return np.asarray(self._get_attr("data"))
+        if key == "latitudes":
+            return np.asarray(self._get_attr("lats"))
+        if key == "longitudes":
+            return np.asarray(self._get_attr("lons"))
+        if key == "cfVarName":
+            return self._get_attr("shortName")
+        if key == "typeOfLevel":
+            return self._type_of_level()
+        if key == "level":
+            return self._level_value()
+        if key in {"step", "step:int"}:
+            return self._as_timedelta64(self._get_attr("leadTime"))
+        if key == "time":
+            return self._as_datetime64(self._get_attr("refDate"))
+        if key == "valid_time":
+            return self._as_datetime64(self._get_attr("validDate"))
+        if key == "gridType":
+            if hasattr(self._message, "gridType"):
+                return self._unwrap_value(getattr(self._message, "gridType"))
+            gdtn = int(self._get_attr("gdtn"))
+            return self._GRID_TYPE_BY_GDTN.get(gdtn, f"gdtn_{gdtn}")
+
+        attr_name = self._KEY_ALIASES.get(key, key)
+        return self._get_attr(attr_name)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def _type_of_level(self):
+        code = self.get("typeOfFirstFixedSurface")
+        if isinstance(code, int) and code in self._TYPE_OF_LEVEL_BY_SURFACE:
+            return self._TYPE_OF_LEVEL_BY_SURFACE[code]
+
+        level = str(self._get_attr("level")).strip().lower()
+        if level == "entire atmosphere":
+            return "atmosphere"
+        if "mb" in level or "hpa" in level:
+            return "isobaricInhPa"
+        return level.replace(" ", "")
+
+    def _level_value(self):
+        raw = self._get_attr("level")
+        if isinstance(raw, (int, float, np.integer, np.floating)):
+            return float(raw)
+
+        if isinstance(raw, str):
+            match = re.search(r"[-+]?\d*\.?\d+", raw)
+            if match:
+                return float(match.group())
+
+        fallback = self.get("valueOfFirstFixedSurface")
+        if isinstance(fallback, (int, float, np.integer, np.floating)):
+            return float(fallback)
+
+        return 0.0
+
+    @staticmethod
+    def _as_datetime64(value):
+        if isinstance(value, np.datetime64):
+            return value
+        return np.datetime64(value, "s")
+
+    @staticmethod
+    def _as_timedelta64(value):
+        if isinstance(value, np.timedelta64):
+            return value
+        if hasattr(value, "total_seconds"):
+            seconds = int(round(value.total_seconds()))
+            return np.timedelta64(seconds, "s")
+        return np.timedelta64(int(value), "s")
+
+    def message_grib_keys(self):
+        keys = set()
+        for section in range(6):
+            try:
+                keys.update(self._message.attrs_by_section(section))
+            except Exception:
+                continue
+
+        keys.update(
+            {
+                "Ny",
+                "Nx",
+                "values",
+                "gridType",
+                "latitudes",
+                "longitudes",
+                "cfVarName",
+                "shortName",
+                "typeOfLevel",
+                "level",
+                "topLevel",
+                "step",
+                "time",
+                "valid_time",
+            }
+        )
+        return keys
+
+    def close(self):
+        self._file_handle.close()
+
+
+class _CfgribEngine:
+    def __init__(self):
+        self._cfgrib = _require_cfgrib()
+
+    @property
+    def dataset(self):
+        return self._cfgrib.dataset
+
+    def message_from_data(self, data):
+        import eccodes
+
+        codes_id = eccodes.codes_new_from_message(data)
+        msg = self._cfgrib.cfmessage.CfMessage(codes_id)
+        return _CfgribMessageAdapter(msg, codes_id)
+
+    def data_dtype_and_size(self, message):
+        import eccodes
+
+        native_type = eccodes.codes_get_native_type(message.codes_id, "values")
+        data_size = eccodes.codes_get_size(message.codes_id, "values")
+        return native_type, data_size
+
+    def close(self, message):
+        # cfgrib owns the ecCodes handle lifecycle for CfMessage.
+        # Explicitly releasing here can lead to double-free segfaults.
+        return None
+
+
+class _Grib2ioEngine:
+    def __init__(self):
+        # Keep cfgrib's metadata conventions for now to preserve output compatibility.
+        self._cfgrib = _require_cfgrib()
+        self._grib2io = _require_grib2io()
+
+    @property
+    def dataset(self):
+        return self._cfgrib.dataset
+
+    def message_from_data(self, data):
+        grib_file = self._grib2io.open(
+            data, mode="r", use_index=False, save_index=False
+        )
+        if not grib_file.messages:
+            grib_file.close()
+            raise ValueError("grib2io returned no message for GRIB payload")
+        msg = grib_file[0]
+        return _Grib2ioMessageAdapter(msg, grib_file)
+
+    def data_dtype_and_size(self, message):
+        values = message["values"]
+        return values.dtype, values.size
+
+    def close(self, message):
+        message.close()
+
+
+def _get_grib_engine():
+    engine_name = _resolve_grib_engine()
+    if engine_name == "grib2io":
+        return _Grib2ioEngine()
+    return _CfgribEngine()
 
 
 # cfgrib copies over certain GRIB attributes
@@ -173,6 +455,7 @@ def scan_grib(
     import eccodes
 
     storage_options = storage_options or {}
+    engine = _get_grib_engine()
     logger.debug(f"Open {url}")
 
     # This is hardcoded a lot in cfgrib!
@@ -186,174 +469,176 @@ def scan_grib(
         for offset, size, data in _split_file(f, skip=skip):
             store_dict = {}
             store = dict_to_store(store_dict)
+            m = engine.message_from_data(data)
+            try:
+                # It would be nice to just have a list of valid keys
+                # There does not seem to be a nice API for this
+                # 1. message_grib_keys returns keys coded in the message
+                # 2. There exist "computed" keys, that are functions applied on the data
+                # 3. There are also aliases!
+                #    e.g. "number" is an alias of "perturbationNumber", and cfgrib uses this alias
+                # So we stick to checking membership in 'm', which ends up doing
+                # a lot of reads.
+                message_keys = set(m.message_grib_keys())
+                # The choices here copy cfgrib :(
+                # message_keys.update(cfgrib.dataset.INDEX_KEYS)
+                # message_keys.update(TIME_DIMS)
+                # print("totalNumber" in cfgrib.dataset.INDEX_KEYS)
+                # Adding computed keys adds a lot that isn't added by cfgrib
+                # message_keys.extend(m.computed_keys)
 
-            mid = eccodes.codes_new_from_message(data)
-            m = cfgrib.cfmessage.CfMessage(mid)
+                shape = (m["Ny"], m["Nx"])
+                native_type, data_size = engine.data_dtype_and_size(m)
+                coordinates = []
 
-            # It would be nice to just have a list of valid keys
-            # There does not seem to be a nice API for this
-            # 1. message_grib_keys returns keys coded in the message
-            # 2. There exist "computed" keys, that are functions applied on the data
-            # 3. There are also aliases!
-            #    e.g. "number" is an alias of "perturbationNumber", and cfgrib uses this alias
-            # So we stick to checking membership in 'm', which ends up doing
-            # a lot of reads.
-            message_keys = set(m.message_grib_keys())
-            # The choices here copy cfgrib :(
-            # message_keys.update(cfgrib.dataset.INDEX_KEYS)
-            # message_keys.update(TIME_DIMS)
-            # print("totalNumber" in cfgrib.dataset.INDEX_KEYS)
-            # Adding computed keys adds a lot that isn't added by cfgrib
-            # message_keys.extend(m.computed_keys)
-
-            shape = (m["Ny"], m["Nx"])
-            # thank you, gribscan
-            native_type = eccodes.codes_get_native_type(m.codes_id, "values")
-            data_size = eccodes.codes_get_size(m.codes_id, "values")
-            coordinates = []
-
-            good = True
-            for k, v in (filter or {}).items():
-                if k not in m:
-                    good = False
-                elif isinstance(v, (list, tuple, set)):
-                    if m[k] not in v:
+                good = True
+                for k, v in (filter or {}).items():
+                    if k not in m:
                         good = False
-                elif m[k] != v:
-                    good = False
-            if good is False:
-                continue
-
-            z = zarr.open_group(store, zarr_format=2)
-            global_attrs = {
-                f"GRIB_{k}": m[k]
-                for k in cfgrib.dataset.GLOBAL_ATTRIBUTES_KEYS
-                if k in m
-            }
-            if "GRIB_centreDescription" in global_attrs:
-                # follow CF compliant renaming from cfgrib
-                global_attrs["institution"] = global_attrs["GRIB_centreDescription"]
-            z.attrs.update(global_attrs)
-
-            if data_size < inline_threshold:
-                # read the data
-                vals = m["values"].reshape(shape)
-            else:
-                # dummy array to match the required interface
-                vals = np.empty(shape, dtype=native_type)
-                assert vals.size == data_size
-
-            attrs = {
-                # Follow cfgrib convention and rename key
-                f"GRIB_{k}": m[k]
-                for k in cfgrib.dataset.DATA_ATTRIBUTES_KEYS
-                + cfgrib.dataset.EXTRA_DATA_ATTRIBUTES_KEYS
-                + cfgrib.dataset.GRID_TYPE_MAP.get(m["gridType"], [])
-                if k in m
-            }
-            for k, v in ATTRS_TO_COPY_OVER.items():
-                if v in attrs:
-                    attrs[k] = attrs[v]
-
-            # try to use cfVarName if available,
-            # otherwise use the grib shortName
-            varName = m["cfVarName"]
-            if varName in ("undef", "unknown"):
-                varName = m["shortName"]
-            _store_array(
-                store_dict, z, vals, varName, inline_threshold, offset, size, attrs
-            )
-            if "typeOfLevel" in message_keys and contains_valid_level(message_keys):
-                name = m["typeOfLevel"]
-                coordinates.append(name)
-                # convert to numpy scalar, so that .tobytes can be used for inlining
-                # dtype=float is hardcoded in cfgrib
-                data = np.array(m["level"], dtype=float)[()]
-                try:
-                    attrs = cfgrib.dataset.COORD_ATTRS[name]
-                except KeyError:
-                    logger.debug(f"Couldn't find coord {name} in dataset")
-                    attrs = {}
-                attrs["_ARRAY_DIMENSIONS"] = []
-                _store_array(
-                    store_dict, z, data, name, inline_threshold, offset, size, attrs
-                )
-            dims = (
-                ["y", "x"]
-                if m["gridType"] in cfgrib.dataset.GRID_TYPES_2D_NON_DIMENSION_COORDS
-                else ["latitude", "longitude"]
-            )
-            z[varName].attrs["_ARRAY_DIMENSIONS"] = dims
-
-            for coord in cfgrib.dataset.COORD_ATTRS:
-                coord2 = {
-                    "latitude": "latitudes",
-                    "longitude": "longitudes",
-                    "step": "step:int",
-                }.get(coord, coord)
-                try:
-                    x = m.get(coord2)
-                except eccodes.WrongStepUnitError as e:
-                    logger.warning(
-                        "Ignoring coordinate '%s' for varname '%s', raises: eccodes.WrongStepUnitError(%s)",
-                        coord2,
-                        varName,
-                        e,
-                    )
+                    elif isinstance(v, (list, tuple, set)):
+                        if m[k] not in v:
+                            good = False
+                    elif m[k] != v:
+                        good = False
+                if good is False:
                     continue
 
-                if x is None:
-                    continue
-                coordinates.append(coord)
-                inline_extra = 0
-                if isinstance(x, np.ndarray) and x.size == data_size:
-                    if (
-                        m["gridType"]
-                        in cfgrib.dataset.GRID_TYPES_2D_NON_DIMENSION_COORDS
-                    ):
-                        dims = ["y", "x"]
-                        x = x.reshape(vals.shape)
-                    else:
-                        dims = [coord]
-                        if coord == "latitude":
-                            x = x.reshape(vals.shape)[:, 0].copy()
-                        elif coord == "longitude":
-                            x = x.reshape(vals.shape)[0].copy()
-                        # force inlining of x/y/latitude/longitude coordinates.
-                        # since these are derived from analytic formulae
-                        # and are not stored in the message
-                        inline_extra = x.nbytes + 1
-                elif np.isscalar(x):
-                    # convert python scalars to numpy scalar
-                    # so that .tobytes can be used for inlining
-                    x = np.array(x)[()]
-                    dims = []
-                else:
-                    x = np.array([x])
-                    dims = [coord]
-                attrs = cfgrib.dataset.COORD_ATTRS[coord]
-                _store_array(
-                    store_dict,
-                    z,
-                    x,
-                    coord,
-                    inline_threshold + inline_extra,
-                    offset,
-                    size,
-                    attrs,
-                )
-                z[coord].attrs["_ARRAY_DIMENSIONS"] = dims
-            if coordinates:
-                z.attrs["coordinates"] = " ".join(coordinates)
-
-            translate_refs_serializable(store_dict)
-            out.append(
-                {
-                    "version": 1,
-                    "refs": _encode_for_JSON(store_dict),
-                    "templates": {"u": url},
+                z = zarr.open_group(store, zarr_format=2)
+                global_attrs = {
+                    f"GRIB_{k}": m[k]
+                    for k in engine.dataset.GLOBAL_ATTRIBUTES_KEYS
+                    if k in m
                 }
-            )
+                if "GRIB_centreDescription" in global_attrs:
+                    # follow CF compliant renaming from cfgrib
+                    global_attrs["institution"] = global_attrs["GRIB_centreDescription"]
+                z.attrs.update(global_attrs)
+
+                if data_size < inline_threshold:
+                    # read the data
+                    vals = m["values"].reshape(shape)
+                else:
+                    # dummy array to match the required interface
+                    vals = np.empty(shape, dtype=native_type)
+                    assert vals.size == data_size
+
+                attrs = {
+                    # Follow cfgrib convention and rename key
+                    f"GRIB_{k}": m[k]
+                    for k in engine.dataset.DATA_ATTRIBUTES_KEYS
+                    + engine.dataset.EXTRA_DATA_ATTRIBUTES_KEYS
+                    + engine.dataset.GRID_TYPE_MAP.get(m["gridType"], [])
+                    if k in m
+                }
+                for k, v in ATTRS_TO_COPY_OVER.items():
+                    if v in attrs:
+                        attrs[k] = attrs[v]
+
+                # try to use cfVarName if available,
+                # otherwise use the grib shortName
+                varName = m["cfVarName"]
+                if varName in ("undef", "unknown"):
+                    varName = m["shortName"]
+                _store_array(
+                    store_dict, z, vals, varName, inline_threshold, offset, size, attrs
+                )
+                if "typeOfLevel" in message_keys and contains_valid_level(message_keys):
+                    name = m["typeOfLevel"]
+                    coordinates.append(name)
+                    # convert to numpy scalar, so that .tobytes can be used for inlining
+                    # dtype=float is hardcoded in cfgrib
+                    data = np.array(m["level"], dtype=float)[()]
+                    try:
+                        attrs = engine.dataset.COORD_ATTRS[name]
+                    except KeyError:
+                        logger.debug(f"Couldn't find coord {name} in dataset")
+                        attrs = {}
+                    attrs["_ARRAY_DIMENSIONS"] = []
+                    _store_array(
+                        store_dict, z, data, name, inline_threshold, offset, size, attrs
+                    )
+                dims = (
+                    ["y", "x"]
+                    if m["gridType"]
+                    in engine.dataset.GRID_TYPES_2D_NON_DIMENSION_COORDS
+                    else ["latitude", "longitude"]
+                )
+                z[varName].attrs["_ARRAY_DIMENSIONS"] = dims
+
+                for coord in engine.dataset.COORD_ATTRS:
+                    coord2 = {
+                        "latitude": "latitudes",
+                        "longitude": "longitudes",
+                        "step": "step:int",
+                    }.get(coord, coord)
+                    try:
+                        x = m.get(coord2)
+                    except eccodes.WrongStepUnitError as e:
+                        logger.warning(
+                            (
+                                "Ignoring coordinate '%s' for varname '%s', raises: "
+                                "eccodes.WrongStepUnitError(%s)"
+                            ),
+                            coord2,
+                            varName,
+                            e,
+                        )
+                        continue
+
+                    if x is None:
+                        continue
+                    coordinates.append(coord)
+                    inline_extra = 0
+                    if isinstance(x, np.ndarray) and x.size == data_size:
+                        if (
+                            m["gridType"]
+                            in engine.dataset.GRID_TYPES_2D_NON_DIMENSION_COORDS
+                        ):
+                            dims = ["y", "x"]
+                            x = x.reshape(vals.shape)
+                        else:
+                            dims = [coord]
+                            if coord == "latitude":
+                                x = x.reshape(vals.shape)[:, 0].copy()
+                            elif coord == "longitude":
+                                x = x.reshape(vals.shape)[0].copy()
+                            # force inlining of x/y/latitude/longitude coordinates.
+                            # since these are derived from analytic formulae
+                            # and are not stored in the message
+                            inline_extra = x.nbytes + 1
+                    elif np.isscalar(x):
+                        # convert python scalars to numpy scalar
+                        # so that .tobytes can be used for inlining
+                        x = np.array(x)[()]
+                        dims = []
+                    else:
+                        x = np.array([x])
+                        dims = [coord]
+                    attrs = engine.dataset.COORD_ATTRS[coord]
+                    _store_array(
+                        store_dict,
+                        z,
+                        x,
+                        coord,
+                        inline_threshold + inline_extra,
+                        offset,
+                        size,
+                        attrs,
+                    )
+                    z[coord].attrs["_ARRAY_DIMENSIONS"] = dims
+                if coordinates:
+                    z.attrs["coordinates"] = " ".join(coordinates)
+
+                translate_refs_serializable(store_dict)
+                out.append(
+                    {
+                        "version": 1,
+                        "refs": _encode_for_JSON(store_dict),
+                        "templates": {"u": url},
+                    }
+                )
+            finally:
+                engine.close(m)
     logger.debug("Done")
     return out
 
