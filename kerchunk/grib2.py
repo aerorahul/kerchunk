@@ -130,6 +130,33 @@ class _Grib2ioMessageAdapter:
         160: "depthBelowSea",
     }
 
+    _CF_VAR_NAME_ALIASES = {
+        "DEPR": "unknown",
+        "HGT": "gh",
+        "TMP": "t",
+        "UGRD": "u",
+        "VGRD": "v",
+        "APCP": "acpcp",
+        "ACPCP": "acpcp",
+        "PRMSL": "prmsl",
+        "SPFH": "q",
+        "DPT": "dpt",
+    }
+
+    _ORIGINATING_CENTER = {
+        7: ("kwbc", "US National Weather Service - NCEP"),
+        54: ("cwao", "Canadian Meteorological Service - Montreal"),
+    }
+
+    _GRID_DESCRIPTION_BY_GDTN = {
+        0: "Latitude/longitude",
+        1: "Rotated latitude/longitude",
+        10: "Mercator",
+        20: "Polar stereographic",
+        30: "Lambert Conformal can be secant or tangent, conical or bipolar",
+        40: "Gaussian grid",
+    }
+
     def __init__(self, message, file_handle):
         self._message = message
         self._file_handle = file_handle
@@ -147,6 +174,61 @@ class _Grib2ioMessageAdapter:
             raise KeyError(key)
         return self._unwrap_value(getattr(self._message, key))
 
+    def _originating_center_code(self):
+        try:
+            raw = self._get_attr("originatingCenter")
+        except KeyError:
+            return None
+        if isinstance(raw, str):
+            match = re.match(r"^(\d+)", raw)
+            if match:
+                return int(match.group(1))
+        if isinstance(raw, (int, np.integer)):
+            return int(raw)
+        return None
+
+    def _cf_var_name(self):
+        short_name = str(self._get_attr("shortName"))
+        if short_name in self._CF_VAR_NAME_ALIASES:
+            return self._CF_VAR_NAME_ALIASES[short_name]
+        if short_name.isupper():
+            return short_name.lower()
+        return short_name
+
+    def _data_type(self):
+        try:
+            raw = str(self._get_attr("typeOfData"))
+        except KeyError:
+            return "unknown"
+        if "Analysis" in raw and "Forecast" in raw:
+            return "af"
+        if "Forecast" in raw:
+            return "fc"
+        if "Analysis" in raw:
+            return "an"
+        return raw.split("-")[0].strip().lower() or "unknown"
+
+    def _step_type(self):
+        try:
+            duration = self._get_attr("duration")
+        except KeyError:
+            duration = np.timedelta64(0, "s")
+        if hasattr(duration, "total_seconds"):
+            return "instant" if duration.total_seconds() == 0 else "avg"
+        if isinstance(duration, np.timedelta64):
+            return "instant" if duration == np.timedelta64(0, "s") else "avg"
+        return "instant" if duration in (0, 0.0) else "avg"
+
+    def _grid_type(self):
+        if hasattr(self._message, "gridType"):
+            return self._unwrap_value(getattr(self._message, "gridType"))
+        gdtn = int(self._get_attr("gdtn"))
+        return self._GRID_TYPE_BY_GDTN.get(gdtn, f"gdtn_{gdtn}")
+
+    def _grid_definition_description(self):
+        gdtn = int(self._get_attr("gdtn"))
+        return self._GRID_DESCRIPTION_BY_GDTN.get(gdtn, "unknown")
+
     def __contains__(self, key):
         try:
             self[key]
@@ -162,22 +244,59 @@ class _Grib2ioMessageAdapter:
         if key == "longitudes":
             return np.asarray(self._get_attr("lons"))
         if key == "cfVarName":
-            return self._get_attr("shortName")
+            return self._cf_var_name()
+        if key == "cfName":
+            return "unknown"
+        if key == "name":
+            try:
+                return self._get_attr("fullName")
+            except KeyError:
+                return self._get_attr("shortName")
         if key == "typeOfLevel":
             return self._type_of_level()
         if key == "level":
             return self._level_value()
         if key in {"step", "step:int"}:
             return self._as_timedelta64(self._get_attr("leadTime"))
+        if key == "stepType":
+            return self._step_type()
+        if key == "stepUnits":
+            return 1
         if key == "time":
             return self._as_datetime64(self._get_attr("refDate"))
         if key == "valid_time":
             return self._as_datetime64(self._get_attr("validDate"))
         if key == "gridType":
-            if hasattr(self._message, "gridType"):
-                return self._unwrap_value(getattr(self._message, "gridType"))
-            gdtn = int(self._get_attr("gdtn"))
-            return self._GRID_TYPE_BY_GDTN.get(gdtn, f"gdtn_{gdtn}")
+            return self._grid_type()
+        if key == "dataType":
+            return self._data_type()
+        if key == "numberOfPoints":
+            return int(self._get_attr("numberOfDataPoints"))
+        if key == "missingValue":
+            return float(np.finfo(np.float32).max)
+        if key == "gridDefinitionDescription":
+            return self._grid_definition_description()
+        if key == "uvRelativeToGrid":
+            return 1 if self._grid_type() in self._GRID_TYPE_BY_GDTN.values() else 0
+        if key == "NV":
+            return 0
+        if key == "centre":
+            center = self._originating_center_code()
+            if center in self._ORIGINATING_CENTER:
+                return self._ORIGINATING_CENTER[center][0]
+            return str(center) if center is not None else "unknown"
+        if key == "centreDescription":
+            center = self._originating_center_code()
+            if center in self._ORIGINATING_CENTER:
+                return self._ORIGINATING_CENTER[center][1]
+            return "unknown"
+        if key == "subCentre":
+            try:
+                return int(self._get_attr("originatingSubCenter"))
+            except Exception:
+                return 0
+        if key == "edition":
+            return 2
 
         attr_name = self._KEY_ALIASES.get(key, key)
         return self._get_attr(attr_name)
@@ -293,13 +412,230 @@ class _CfgribEngine:
 
 class _Grib2ioEngine:
     def __init__(self):
-        # Keep cfgrib's metadata conventions for now to preserve output compatibility.
-        self._cfgrib = _require_cfgrib()
         self._grib2io = _require_grib2io()
+        class Dataset:
+            GLOBAL_ATTRIBUTES_KEYS = ["edition", "centre", "centreDescription", "subCentre"]
+            DATA_ATTRIBUTES_KEYS = [
+                "paramId",
+                "dataType",
+                "numberOfPoints",
+                "typeOfLevel",
+                "stepUnits",
+                "stepType",
+                "gridType",
+                "uvRelativeToGrid",
+            ]
+            EXTRA_DATA_ATTRIBUTES_KEYS = [
+                "shortName",
+                "units",
+                "name",
+                "cfName",
+                "cfVarName",
+                "missingValue",
+                "totalNumber",
+                "numberOfDirections",
+                "numberOfFrequencies",
+                "NV",
+                "gridDefinitionDescription",
+            ]
+            GRID_TYPES_2D_NON_DIMENSION_COORDS = {
+                "lambert_azimuthal_equal_area",
+                "albers",
+                "rotated_gg",
+                "polar_stereographic",
+                "rotated_ll",
+                "lambert",
+            }
+            GRID_TYPE_MAP = {
+                "lambert": [
+                    "LaDInDegrees",
+                    "LoVInDegrees",
+                    "iScansNegatively",
+                    "jPointsAreConsecutive",
+                    "jScansPositively",
+                    "latitudeOfFirstGridPointInDegrees",
+                    "latitudeOfSouthernPoleInDegrees",
+                    "longitudeOfFirstGridPointInDegrees",
+                    "longitudeOfSouthernPoleInDegrees",
+                    "DyInMetres",
+                    "DxInMetres",
+                    "Latin2InDegrees",
+                    "Latin1InDegrees",
+                    "Ny",
+                    "Nx",
+                ],
+                "reduced_gg": ["N", "pl"],
+                "reduced_ll": [
+                    "Ny",
+                    "jDirectionIncrementInDegrees",
+                    "jPointsAreConsecutive",
+                    "jScansPositively",
+                    "latitudeOfFirstGridPointInDegrees",
+                    "latitudeOfLastGridPointInDegrees",
+                ],
+                "regular_gg": [
+                    "N",
+                    "Ni",
+                    "Nj",
+                    "iDirectionIncrementInDegrees",
+                    "iScansNegatively",
+                    "jScansPositively",
+                    "jPointsAreConsecutive",
+                    "longitudeOfFirstGridPointInDegrees",
+                    "longitudeOfLastGridPointInDegrees",
+                    "latitudeOfFirstGridPointInDegrees",
+                    "latitudeOfLastGridPointInDegrees",
+                ],
+                "regular_ll": [
+                    "Nx",
+                    "iDirectionIncrementInDegrees",
+                    "iScansNegatively",
+                    "longitudeOfFirstGridPointInDegrees",
+                    "longitudeOfLastGridPointInDegrees",
+                    "Ny",
+                    "jDirectionIncrementInDegrees",
+                    "jPointsAreConsecutive",
+                    "jScansPositively",
+                    "latitudeOfFirstGridPointInDegrees",
+                    "latitudeOfLastGridPointInDegrees",
+                ],
+                "rotated_gg": [
+                    "Nx",
+                    "Ny",
+                    "angleOfRotationInDegrees",
+                    "iDirectionIncrementInDegrees",
+                    "iScansNegatively",
+                    "jPointsAreConsecutive",
+                    "jScansPositively",
+                    "latitudeOfFirstGridPointInDegrees",
+                    "latitudeOfLastGridPointInDegrees",
+                    "latitudeOfSouthernPoleInDegrees",
+                    "longitudeOfFirstGridPointInDegrees",
+                    "longitudeOfLastGridPointInDegrees",
+                    "longitudeOfSouthernPoleInDegrees",
+                    "N",
+                ],
+                "rotated_ll": [
+                    "Nx",
+                    "Ny",
+                    "angleOfRotationInDegrees",
+                    "iDirectionIncrementInDegrees",
+                    "iScansNegatively",
+                    "jDirectionIncrementInDegrees",
+                    "jPointsAreConsecutive",
+                    "jScansPositively",
+                    "latitudeOfFirstGridPointInDegrees",
+                    "latitudeOfLastGridPointInDegrees",
+                    "latitudeOfSouthernPoleInDegrees",
+                    "longitudeOfFirstGridPointInDegrees",
+                    "longitudeOfLastGridPointInDegrees",
+                    "longitudeOfSouthernPoleInDegrees",
+                ],
+                "sh": ["M", "K", "J"],
+            }
+            COORD_ATTRS = {
+                "depthBelowLand": {
+                    "long_name": "soil depth",
+                    "positive": "down",
+                    "standard_name": "depth",
+                    "units": "m",
+                },
+                "depthBelowLandLayer": {
+                    "long_name": "soil depth",
+                    "positive": "down",
+                    "standard_name": "depth",
+                    "units": "m",
+                },
+                "forecastMonth": {
+                    "long_name": "months since forecast_reference_time",
+                    "units": "1",
+                },
+                "heightAboveGround": {
+                    "long_name": "height above the surface",
+                    "positive": "up",
+                    "standard_name": "height",
+                    "units": "m",
+                },
+                "hybrid": {
+                    "long_name": "hybrid level",
+                    "positive": "down",
+                    "standard_name": "atmosphere_hybrid_sigma_pressure_coordinate",
+                    "units": "1",
+                },
+                "indexing_time": {
+                    "calendar": "proleptic_gregorian",
+                    "long_name": "nominal initial time of forecast",
+                    "standard_name": "forecast_reference_time",
+                    "units": "seconds since 1970-01-01T00:00:00",
+                },
+                "isobaricInPa": {
+                    "long_name": "pressure",
+                    "positive": "down",
+                    "standard_name": "air_pressure",
+                    "stored_direction": "decreasing",
+                    "units": "Pa",
+                },
+                "isobaricInhPa": {
+                    "long_name": "pressure",
+                    "positive": "down",
+                    "standard_name": "air_pressure",
+                    "stored_direction": "decreasing",
+                    "units": "hPa",
+                },
+                "isobaricLayer": {
+                    "long_name": "pressure",
+                    "positive": "down",
+                    "standard_name": "air_pressure",
+                    "units": "Pa",
+                },
+                "latitude": {
+                    "long_name": "latitude",
+                    "standard_name": "latitude",
+                    "units": "degrees_north",
+                },
+                "longitude": {
+                    "long_name": "longitude",
+                    "standard_name": "longitude",
+                    "units": "degrees_east",
+                },
+                "number": {
+                    "long_name": "ensemble member numerical id",
+                    "standard_name": "realization",
+                    "units": "1",
+                },
+                "step": {
+                    "dtype": "timedelta64[ns]",
+                    "long_name": "time since forecast_reference_time",
+                    "standard_name": "forecast_period",
+                    "units": "hours",
+                },
+                "time": {
+                    "calendar": "proleptic_gregorian",
+                    "long_name": "initial time of forecast",
+                    "standard_name": "forecast_reference_time",
+                    "units": "seconds since 1970-01-01T00:00:00",
+                },
+                "valid_month": {
+                    "calendar": "proleptic_gregorian",
+                    "long_name": "time",
+                    "standard_name": "time",
+                    "units": "seconds since 1970-01-01T00:00:00",
+                },
+                "valid_time": {
+                    "calendar": "proleptic_gregorian",
+                    "long_name": "time",
+                    "standard_name": "time",
+                    "units": "seconds since 1970-01-01T00:00:00",
+                },
+                "verifying_time": {
+                    "calendar": "proleptic_gregorian",
+                    "long_name": "time",
+                    "standard_name": "time",
+                    "units": "seconds since 1970-01-01T00:00:00",
+                },
+            }
 
-    @property
-    def dataset(self):
-        return self._cfgrib.dataset
+        self.dataset = Dataset()
 
     def message_from_data(self, data):
         grib_file = self._grib2io.open(
@@ -452,7 +788,7 @@ def scan_grib(
 
     list(dict): references dicts in Version 1 format, one per message in the file
     """
-    import eccodes
+    # Do not import eccodes here; only import in cfgrib backend code paths if needed
 
     storage_options = storage_options or {}
     engine = _get_grib_engine()
@@ -464,6 +800,13 @@ def scan_grib(
     # TIME_DIMS = ["step", "time", "valid_time"]
 
     out = []
+
+    def _infer_number_from_url(source_url):
+        match = re.search(r"(?:^|[_/])(gec|gep|c)(\d{2})(?:$|[_/.])", str(source_url))
+        if match:
+            return int(match.group(2))
+        return None
+
     with fsspec.open(url, "rb", **storage_options) as f:
         logger.debug(f"File {url}")
         for offset, size, data in _split_file(f, skip=skip):
@@ -537,7 +880,7 @@ def scan_grib(
                 # try to use cfVarName if available,
                 # otherwise use the grib shortName
                 varName = m["cfVarName"]
-                if varName in ("undef", "unknown"):
+                if varName in ("undef", "unknown") and str(m["shortName"]).upper() != "DEPR":
                     varName = m["shortName"]
                 _store_array(
                     store_dict, z, vals, varName, inline_threshold, offset, size, attrs
@@ -571,19 +914,43 @@ def scan_grib(
                         "longitude": "longitudes",
                         "step": "step:int",
                     }.get(coord, coord)
-                    try:
-                        x = m.get(coord2)
-                    except eccodes.WrongStepUnitError as e:
-                        logger.warning(
-                            (
-                                "Ignoring coordinate '%s' for varname '%s', raises: "
-                                "eccodes.WrongStepUnitError(%s)"
-                            ),
-                            coord2,
-                            varName,
-                            e,
-                        )
-                        continue
+                    x = None
+                    if coord == "number":
+                        try:
+                            x = m.get(coord2)
+                        except Exception:
+                            x = None
+                        if x is None:
+                            x = _infer_number_from_url(url)
+                        if x is None:
+                            continue
+                    elif _resolve_grib_engine() == "cfgrib":
+                        try:
+                            x = m.get(coord2)
+                        except Exception as e:
+                            # Only log WrongStepUnitError if it's that error
+                            try:
+                                import eccodes
+                                if isinstance(e, eccodes.WrongStepUnitError):
+                                    logger.warning(
+                                        (
+                                            "Ignoring coordinate '%s' for varname '%s', raises: "
+                                            "eccodes.WrongStepUnitError(%s)"
+                                        ),
+                                        coord2,
+                                        varName,
+                                        e,
+                                    )
+                                    continue
+                            except ImportError:
+                                pass
+                            # For other exceptions, just skip
+                            continue
+                    else:
+                        try:
+                            x = m.get(coord2)
+                        except Exception:
+                            continue
 
                     if x is None:
                         continue

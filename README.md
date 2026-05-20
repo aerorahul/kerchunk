@@ -1,3 +1,21 @@
+## GRIB2 Backend Selection
+
+Kerchunk supports two mutually exclusive backends for GRIB2 file processing: `grib2io` and `cfgrib` (with eccodes). The backend is selected at runtime using the environment variable `KERCHUNK_GRIB_ENGINE`.
+
+- Set `KERCHUNK_GRIB_ENGINE=grib2io` to use the [grib2io](https://github.com/jswhit/grib2io) backend (recommended for pure Python, no eccodes/cfgrib dependency).
+- Set `KERCHUNK_GRIB_ENGINE=cfgrib` to use the [cfgrib](https://github.com/ecmwf/cfgrib) backend (requires eccodes and cfgrib).
+- If the variable is unset or invalid, the default is `cfgrib`.
+
+**Only the selected backend is imported and used.** If you choose `grib2io`, you do not need to install eccodes or cfgrib. If you choose `cfgrib`, you do not need grib2io.
+
+Example usage:
+
+```bash
+export KERCHUNK_GRIB_ENGINE=grib2io
+python -m pytest tests/test_grib.py
+```
+
+See the documentation for more details on backend-specific requirements and behavior.
 # kerchunk
 
 Cloud-friendly access to archival data
