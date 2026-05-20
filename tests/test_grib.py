@@ -1,6 +1,6 @@
 import os.path
+from importlib.util import find_spec
 
-import eccodes
 import fsspec
 import numpy as np
 import pandas as pd
@@ -25,8 +25,24 @@ from kerchunk.grib2 import (
 )
 from kerchunk.utils import fs_as_store, refs_as_store
 
-eccodes_ver = tuple(int(i) for i in eccodes.__version__.split("."))
-cfgrib = pytest.importorskip("cfgrib")
+if find_spec("eccodes"):
+    import eccodes
+
+    eccodes_ver = tuple(int(i) for i in eccodes.__version__.split("."))
+else:
+    eccodes_ver = None
+
+
+def _selected_engine():
+    return _resolve_grib_engine()
+
+
+def _cfgrib_for_selected_engine():
+    if _selected_engine() != "cfgrib":
+        pytest.skip("cfgrib comparison is only valid when KERCHUNK_GRIB_ENGINE=cfgrib")
+    return pytest.importorskip("cfgrib")
+
+
 here = os.path.dirname(__file__)
 
 
@@ -51,6 +67,11 @@ def test_one():
     ds = xr.open_zarr(store, zarr_format=2, consolidated=False)
 
     assert ds.attrs["GRIB_centre"] == "cwao"
+    if _selected_engine() != "cfgrib":
+        assert len(ds.data_vars) > 0
+        assert len(ds.coords) > 0
+        return
+
     ds2 = xr.open_dataset(fn, engine="cfgrib", backend_kwargs={"indexpath": ""})
 
     for var in ["latitude", "longitude", "unknown", "isobaricInhPa", "time"]:
@@ -72,7 +93,10 @@ def _fetch_first(url):
     [
         pytest.param(
             "s3://noaa-hrrr-bdp-pds/hrrr.20140730/conus/hrrr.t23z.wrfsubhf08.grib2",
-            marks=pytest.mark.skipif(eccodes_ver >= (2, 34), reason="eccodes too new"),
+            marks=pytest.mark.skipif(
+                eccodes_ver is not None and eccodes_ver >= (2, 34),
+                reason="eccodes too new",
+            ),
         ),
         "s3://noaa-gefs-pds/gefs.20221011/00/atmos/pgrb2ap5/gep01.t00z.pgrb2a.0p50.f570",
         "s3://noaa-gefs-retrospective/GEFSv12/reforecast/2000/2000010100/c00/Days:10-16/acpcp_sfc_2000010100_c00.grib2",
@@ -91,6 +115,12 @@ def test_archives(tmpdir, url):
     with open(fn, "wb") as f:
         f.write(data)
 
+    if _selected_engine() != "cfgrib":
+        assert len(ours.data_vars) > 0
+        assert len(ours.coords) > 0
+        return
+
+    cfgrib = _cfgrib_for_selected_engine()
     theirs = cfgrib.open_dataset(fn)
     if "hrrr" in url:
         # for some reason, cfgrib reads `step` as 7.25 hours
